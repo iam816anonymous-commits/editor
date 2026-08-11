@@ -1,1 +1,108 @@
 @import "tailwindcss";
+
+@keyframes fallRain {
+  0% {
+    transform: translateY(-50px) rotate(12deg);
+    opacity: 0;
+  }
+  10% {
+    opacity: 0.6;
+  }
+  90% {
+    opacity: 0.6;
+  }
+  100% {
+    transform: translateY(105vh) rotate(12deg);
+    opacity: 0;
+  }
+}
+
+@keyframes fallSnow {
+  0% {
+    transform: translateY(-20px) translateX(0) rotate(0deg);
+    opacity: 0;
+  }
+  10% {
+    opacity: 0.8;
+  }
+  90% {
+    opacity: 0.8;
+  }
+  100% {
+    transform: translateY(105vh) translateX(50px) rotate(360deg);
+    opacity: 0;
+  }
+}
+
+@keyframes driftFirefly {
+  0%, 100% {
+    transform: translate(0, 0) scale(0.8);
+    opacity: 0.2;
+  }
+  50% {
+    transform: translate(30px, -40px) scale(1.2);
+    opacity: 1;
+  }
+}
+
+@keyframes driftLeaf {
+  0% {
+    transform: translateY(-20px) translateX(0) rotate(45deg);
+    opacity: 0;
+  }
+  10% {
+    opacity: 0.8;
+  }
+  90% {
+    opacity: 0.8;
+  }
+  100% {
+    transform: translateY(105vh) translateX(-100px) rotate(405deg);
+    opacity: 0;
+  }
+}
+
+@keyframes riseEmber {
+  0% {
+    transform: translateY(105vh) translateX(0) scale(0.8);
+    opacity: 0;
+  }
+  10% {
+    opacity: 0.8;
+  }
+  90% {
+    opacity: 0.8;
+  }
+  100% {
+    transform: translateY(-20px) translateX(-40px) scale(1.2);
+    opacity: 0;
+  }
+}
+
+@keyframes scanLine {
+  0% {
+    top: 0%;
+  }
+  50% {
+    top: 100%;
+  }
+  100% {
+    top: 0%;
+  }
+}
+
+/* Custom Scrollbars to match professional creative tools */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #090d16;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #334155;
+}
