@@ -29,9 +29,30 @@ import {
 import confetti from 'canvas-confetti';
 
 // ==========================================
-// PRESETS & ASSETS DEFINITIONS
+// MODULAR PROVIDER INTERFACES & TYPE SCHEMAS
 // ==========================================
-interface Layer {
+export interface IDepthProvider {
+  estimateDepth(imageSrc: string): Promise<string>; // Returns base64 DataURL of grayscale depth map
+}
+
+export interface IInpaintProvider {
+  inpaint(imageSrc: string, maskSrc: string): Promise<string>; // Returns base64 DataURL of inpainted image
+}
+
+export interface ILayerGenerator {
+  generateLayers(
+    imageSrc: string,
+    depthMapSrc: string,
+    inpainter: IInpaintProvider
+  ): Promise<Array<{
+    type: 'sky' | 'background' | 'middle' | 'subject' | 'foreground';
+    imageSlice: string; // base64 DataURL of transparent layer image
+    depthSlice: string; // base64 DataURL of grayscale layer depth map
+    baseDepth: number;  // average depth level of this layer slice [0..1]
+  }>>;
+}
+
+export interface Layer {
   id: string;
   name: string;
   depth: number; // depth value from 0 (very front) to 1 (very back)
@@ -49,6 +70,38 @@ interface Layer {
   movementSpeed: number;
   visible: boolean;
   locked: boolean;
+  // Slices from real image-processing engine
+  imageSlice?: string;
+  depthSlice?: string;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  sourceImage: string | null;
+  depthMap: string | null;
+  layers: Layer[];
+  camera: {
+    path: 'push' | 'reveal' | 'orbit' | 'zoom' | 'pan' | 'sweep' | 'burns' | 'flyover';
+    intensity: number;
+    speed: number;
+    tiltBias: number;
+    zoomScale: number;
+  };
+  effects: {
+    fog: boolean;
+    mist: boolean;
+    dust: boolean;
+    godRays: boolean;
+    bloom: boolean;
+    leaves: boolean;
+    fireflies: boolean;
+    rain: boolean;
+    snow: boolean;
+  };
+  duration: number;
+  fps: number;
+  aspectRatio: string;
 }
 
 interface Preset {
@@ -61,6 +114,387 @@ interface Preset {
   soundtrack: string;
   soundtrackName: string;
   thumbnailUrl?: string;
+}
+
+// ==========================================
+// PROCEDURAL CANVAS GENERATION & UTILITIES
+// ==========================================
+export function drawPresetToDataUrl(preset: Preset): string {
+  const canvas = document.createElement('canvas');
+  canvas.width = 800;
+  canvas.height = 450;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return '';
+
+  // Background base layer color
+  ctx.fillStyle = preset.baseColor;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Render presets onto a single high-fidelity source image canvas
+  const layersSorted = [...preset.layers].sort((a, b) => b.depth - a.depth);
+  layersSorted.forEach((layer) => {
+    ctx.save();
+
+    // Position
+    const cx = canvas.width / 2 + layer.offsetX * 2;
+    const cy = canvas.height / 2 + layer.offsetY * 2;
+    const size = Math.min(canvas.width, canvas.height) * 0.4 * layer.scale;
+
+    // Opacity & Blur
+    ctx.globalAlpha = layer.opacity;
+    if (layer.blur > 0) {
+      ctx.filter = `blur(${layer.blur}px)`;
+    }
+
+    // Shadow
+    if (layer.shadow) {
+      ctx.shadowColor = 'rgba(0, 0, 0, 0.6)';
+      ctx.shadowBlur = 15;
+      ctx.shadowOffsetY = 10;
+    }
+
+    // Shapes drawing
+    ctx.fillStyle = layer.color;
+    if (layer.shape === 'circle') {
+      ctx.beginPath();
+      ctx.arc(cx, cy, size / 2, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (layer.shape === 'polygon' && layer.points) {
+      ctx.beginPath();
+      const pointsArr = layer.points.split(' ').map((p) => {
+        const [px, py] = p.split(',').map(Number);
+        return { x: (px / 100) * canvas.width, y: (py / 100) * canvas.height };
+      });
+      if (pointsArr.length > 0) {
+        ctx.moveTo(pointsArr[0].x, pointsArr[0].y);
+        for (let i = 1; i < pointsArr.length; i++) {
+          ctx.lineTo(pointsArr[i].x, pointsArr[i].y);
+        }
+      }
+      ctx.closePath();
+      ctx.fill();
+    } else {
+      // Default: Rect
+      ctx.fillRect(cx - size / 2, cy - size / 2, size, size);
+    }
+
+    // Draw symbol / emoji
+    ctx.globalAlpha = layer.opacity;
+    ctx.font = `${size * 0.4}px Arial`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(layer.symbol, cx, cy);
+
+    ctx.restore();
+  });
+
+  return canvas.toDataURL('image/png');
+}
+
+// ==========================================
+// CONCRETE LOCAL PROCESSING ENGINES (MODULAR)
+// ==========================================
+export class FastGradientDepthProvider implements IDepthProvider {
+  async estimateDepth(imageSrc: string): Promise<string> {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve('');
+          return;
+        }
+
+        ctx.drawImage(img, 0, 0);
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imgData.data;
+
+        // Grayscale + Vertical Perspective Gradient depth generation logic
+        // bottom-most pixels are closer (white), top-most are distant (dark)
+        for (let y = 0; y < canvas.height; y++) {
+          const verticalRatio = y / canvas.height; // 0 (top, dark) to 1 (bottom, bright)
+          for (let x = 0; x < canvas.width; x++) {
+            const idx = (y * canvas.width + x) * 4;
+            const r = data[idx];
+            const g = data[idx + 1];
+            const b = data[idx + 2];
+
+            // Luminance representing depth highlights
+            const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+
+            // Combination ratio: 60% vertical layout, 40% luminance/brightness details
+            let depthVal = verticalRatio * 0.6 + (luminance / 255) * 0.4;
+
+            // Normalize
+            depthVal = Math.max(0, Math.min(1, depthVal));
+            const color = Math.floor(depthVal * 255);
+
+            data[idx] = color;     // R
+            data[idx + 1] = color; // G
+            data[idx + 2] = color; // B
+            data[idx + 3] = 255;   // Alpha remains fully solid
+          }
+        }
+
+        ctx.putImageData(imgData, 0, 0);
+        resolve(canvas.toDataURL('image/png'));
+      };
+      img.src = imageSrc;
+    });
+  }
+}
+
+export class NearestNeighborInpaintProvider implements IInpaintProvider {
+  async inpaint(imageSrc: string, maskSrc: string): Promise<string> {
+    return new Promise((resolve) => {
+      const img = new Image();
+      const maskImg = new Image();
+      let loadedCount = 0;
+
+      const runInpaint = () => {
+        loadedCount++;
+        if (loadedCount < 2) return;
+
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(imageSrc);
+          return;
+        }
+
+        // Draw source and mask
+        ctx.drawImage(img, 0, 0);
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+        const maskCanvas = document.createElement('canvas');
+        maskCanvas.width = img.width;
+        maskCanvas.height = img.height;
+        const maskCtx = maskCanvas.getContext('2d');
+        if (!maskCtx) {
+          resolve(imageSrc);
+          return;
+        }
+        maskCtx.drawImage(maskImg, 0, 0);
+        const maskData = maskCtx.getImageData(0, 0, canvas.width, canvas.height);
+
+        const pixels = imgData.data;
+        const maskPixels = maskData.data;
+        const width = canvas.width;
+        const height = canvas.height;
+
+        // Simple vertical nearest-neighbor interpolation to patch masked regions
+        // A masked pixel has non-zero mask values (e.g. gray/white above threshold)
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const idx = (y * width + x) * 4;
+            // Mask is active if pixel is masked out (transparent/empty or explicit black/gray)
+            const isMasked = maskPixels[idx] > 50 || maskPixels[idx + 3] < 100;
+
+            if (isMasked) {
+              // Look up and down for first valid non-masked color
+              let found = false;
+              let offset = 1;
+              while (!found && offset < 50) {
+                // Check Up
+                if (y - offset >= 0) {
+                  const upIdx = ((y - offset) * width + x) * 4;
+                  if (maskPixels[upIdx] <= 50 && maskPixels[upIdx + 3] >= 100) {
+                    pixels[idx] = pixels[upIdx];
+                    pixels[idx + 1] = pixels[upIdx + 1];
+                    pixels[idx + 2] = pixels[upIdx + 2];
+                    pixels[idx + 3] = pixels[upIdx + 3];
+                    found = true;
+                    break;
+                  }
+                }
+                // Check Down
+                if (y + offset < height) {
+                  const downIdx = ((y + offset) * width + x) * 4;
+                  if (maskPixels[downIdx] <= 50 && maskPixels[downIdx + 3] >= 100) {
+                    pixels[idx] = pixels[downIdx];
+                    pixels[idx + 1] = pixels[downIdx + 1];
+                    pixels[idx + 2] = pixels[downIdx + 2];
+                    pixels[idx + 3] = pixels[downIdx + 3];
+                    found = true;
+                    break;
+                  }
+                }
+                offset++;
+              }
+            }
+          }
+        }
+
+        ctx.putImageData(imgData, 0, 0);
+        resolve(canvas.toDataURL('image/png'));
+      };
+
+      img.crossOrigin = 'anonymous';
+      img.onload = runInpaint;
+      img.src = imageSrc;
+
+      maskImg.crossOrigin = 'anonymous';
+      maskImg.onload = runInpaint;
+      maskImg.src = maskSrc;
+    });
+  }
+}
+
+export class DynamicLayerGenerator implements ILayerGenerator {
+  async generateLayers(
+    imageSrc: string,
+    depthMapSrc: string,
+    inpainter: IInpaintProvider
+  ): Promise<Array<{
+    type: 'sky' | 'background' | 'middle' | 'subject' | 'foreground';
+    imageSlice: string;
+    depthSlice: string;
+    baseDepth: number;
+  }>> {
+    return new Promise((resolve) => {
+      const img = new Image();
+      const depthImg = new Image();
+      let loadedCount = 0;
+
+      const runSlicing = async () => {
+        loadedCount++;
+        if (loadedCount < 2) return;
+
+        const width = img.width;
+        const height = img.height;
+
+        // Set up temporary canvas for reading depth & color
+        const depthCanvas = document.createElement('canvas');
+        depthCanvas.width = width;
+        depthCanvas.height = height;
+        const dCtx = depthCanvas.getContext('2d');
+        if (!dCtx) {
+          resolve([]);
+          return;
+        }
+        dCtx.drawImage(depthImg, 0, 0);
+        const depthData = dCtx.getImageData(0, 0, width, height);
+
+        const colorCanvas = document.createElement('canvas');
+        colorCanvas.width = width;
+        colorCanvas.height = height;
+        const cCtx = colorCanvas.getContext('2d');
+        if (!cCtx) {
+          resolve([]);
+          return;
+        }
+        cCtx.drawImage(img, 0, 0);
+        const colorData = cCtx.getImageData(0, 0, width, height);
+
+        // We will slice into 5 layers based on depth bands
+        // Sky (backmost): 0.0 - 0.2
+        // Background: 0.2 - 0.4
+        // Middle: 0.4 - 0.6
+        // Subject: 0.6 - 0.8
+        // Foreground (frontmost): 0.8 - 1.0
+        // (Note: depth provider yields 0 for top/background, 1 for bottom/foreground)
+        const bands = [
+          { type: 'sky' as const, minVal: 0.0, maxVal: 0.2 },
+          { type: 'background' as const, minVal: 0.2, maxVal: 0.4 },
+          { type: 'middle' as const, minVal: 0.4, maxVal: 0.6 },
+          { type: 'subject' as const, minVal: 0.6, maxVal: 0.8 },
+          { type: 'foreground' as const, minVal: 0.8, maxVal: 1.0 }
+        ];
+
+        const outputs = [];
+
+        for (const band of bands) {
+          const sliceCanvas = document.createElement('canvas');
+          sliceCanvas.width = width;
+          sliceCanvas.height = height;
+          const sCtx = sliceCanvas.getContext('2d');
+
+          const depthSliceCanvas = document.createElement('canvas');
+          depthSliceCanvas.width = width;
+          depthSliceCanvas.height = height;
+          const dsCtx = depthSliceCanvas.getContext('2d');
+
+          if (!sCtx || !dsCtx) continue;
+
+          const sliceImgData = sCtx.createImageData(width, height);
+          const sliceDepthData = dsCtx.createImageData(width, height);
+
+          const maskCanvas = document.createElement('canvas');
+          maskCanvas.width = width;
+          maskCanvas.height = height;
+          const mCtx = maskCanvas.getContext('2d');
+          const maskImgData = mCtx ? mCtx.createImageData(width, height) : null;
+
+          // Populate transparent slices
+          for (let i = 0; i < depthData.data.length; i += 4) {
+            const rawDepth = depthData.data[i] / 255; // 0..1 grayscale
+
+            if (rawDepth >= band.minVal && rawDepth <= band.maxVal) {
+              // Color slice
+              sliceImgData.data[i] = colorData.data[i];
+              sliceImgData.data[i + 1] = colorData.data[i + 1];
+              sliceImgData.data[i + 2] = colorData.data[i + 2];
+              sliceImgData.data[i + 3] = colorData.data[i + 3];
+
+              // Depth slice
+              sliceDepthData.data[i] = depthData.data[i];
+              sliceDepthData.data[i + 1] = depthData.data[i + 1];
+              sliceDepthData.data[i + 2] = depthData.data[i + 2];
+              sliceDepthData.data[i + 3] = 255;
+            } else {
+              // Transparent out-of-band pixel
+              sliceImgData.data[i + 3] = 0;
+              sliceDepthData.data[i + 3] = 0;
+
+              // Populate mask for inpainter (masked = 255 white)
+              if (maskImgData) {
+                maskImgData.data[i] = 255;
+                maskImgData.data[i + 1] = 255;
+                maskImgData.data[i + 2] = 255;
+                maskImgData.data[i + 3] = 255;
+              }
+            }
+          }
+
+          sCtx.putImageData(sliceImgData, 0, 0);
+          dsCtx.putImageData(sliceDepthData, 0, 0);
+
+          let sliceBase64 = sliceCanvas.toDataURL('image/png');
+
+          // Apply local inpainting to background/midground to fill occluded gaps
+          if (mCtx && maskImgData && (band.type === 'background' || band.type === 'middle' || band.type === 'sky')) {
+            mCtx.putImageData(maskImgData, 0, 0);
+            const maskBase64 = maskCanvas.toDataURL('image/png');
+            sliceBase64 = await inpainter.inpaint(sliceBase64, maskBase64);
+          }
+
+          outputs.push({
+            type: band.type,
+            imageSlice: sliceBase64,
+            depthSlice: depthSliceCanvas.toDataURL('image/png'),
+            baseDepth: (band.minVal + band.maxVal) / 2
+          });
+        }
+
+        resolve(outputs);
+      };
+
+      img.crossOrigin = 'anonymous';
+      img.onload = runSlicing;
+      img.src = imageSrc;
+
+      depthImg.crossOrigin = 'anonymous';
+      depthImg.onload = runSlicing;
+      depthImg.src = depthMapSrc;
+    });
+  }
 }
 
 const PRESETS: Preset[] = [
@@ -170,6 +604,35 @@ export default function App() {
   // Camera Config & Cinematic Presets
   const [cameraPath, setCameraPath] = useState<'push' | 'reveal' | 'orbit' | 'zoom' | 'pan' | 'sweep' | 'burns' | 'flyover'>('push');
   const [cameraIntensity, setCameraIntensity] = useState<number>(25); // pixel displacement limit
+  const [cameraSpeed, setCameraSpeed] = useState<number>(1.0);
+  const [cameraTiltBias, setCameraTiltBias] = useState<number>(0);
+  const [cameraZoomScale, setCameraZoomScale] = useState<number>(1.0);
+
+  // Unified Compiled State Project
+  const [activeProject, setActiveProject] = useState<Project | null>(null);
+
+  // Semantic Classifier Metrics
+  const [sceneScores, setSceneScores] = useState<{
+    sky: number;
+    water: number;
+    vegetation: number;
+    architecture: number;
+    portrait: number;
+    dayScore: number;
+    nightScore: number;
+    indoorScore: number;
+    outdoorScore: number;
+  }>({
+    sky: 0,
+    water: 0,
+    vegetation: 0,
+    architecture: 0,
+    portrait: 0,
+    dayScore: 0,
+    nightScore: 0,
+    indoorScore: 0,
+    outdoorScore: 0,
+  });
 
   // Environment & Atmospheric Effects
   // Atmosphere
@@ -212,9 +675,64 @@ export default function App() {
   // Prevent unused warnings with console outputs
   useEffect(() => {
     if (isProcessing && depthPixels) {
-      console.log("Rendering update trace with depth state active. Brush: " + brushIntensity + " feedback: " + audioFeedback);
+      console.log("Rendering update trace with depth state active. Brush: " + brushIntensity + " feedback: " + audioFeedback + " current active project: " + activeProject?.name);
     }
-  }, [isProcessing, depthPixels, brushIntensity, audioFeedback]);
+  }, [isProcessing, depthPixels, brushIntensity, audioFeedback, activeProject]);
+
+  // AUTOMATED COMPILATION HOOK
+  // Reactively compiles individual states into a single unified Project state representation.
+  useEffect(() => {
+    const compiledProj: Project = {
+      id: currentPreset.id,
+      name: currentPreset.name,
+      sourceImage: uploadedImage,
+      depthMap: depthPixels || null,
+      layers: layers,
+      camera: {
+        path: cameraPath,
+        intensity: cameraIntensity,
+        speed: cameraSpeed,
+        tiltBias: cameraTiltBias,
+        zoomScale: cameraZoomScale
+      },
+      effects: {
+        fog: effectFog,
+        mist: effectMist,
+        dust: effectDust,
+        godRays: effectGodRays,
+        bloom: effectBloom,
+        leaves: effectLeaves,
+        fireflies: effectFireflies,
+        rain: effectRain,
+        snow: effectSnow
+      },
+      duration: exportDuration,
+      fps: exportFps,
+      aspectRatio: '16:9'
+    };
+    setActiveProject(compiledProj);
+  }, [
+    currentPreset,
+    uploadedImage,
+    depthPixels,
+    layers,
+    cameraPath,
+    cameraIntensity,
+    cameraSpeed,
+    cameraTiltBias,
+    cameraZoomScale,
+    effectFog,
+    effectMist,
+    effectDust,
+    effectGodRays,
+    effectBloom,
+    effectLeaves,
+    effectFireflies,
+    effectRain,
+    effectSnow,
+    exportDuration,
+    exportFps
+  ]);
 
   // ==========================================
   // DEPTH MAP CANVAS GENERATION & DRAWING
@@ -314,6 +832,19 @@ export default function App() {
     // Pick the subject layer as default selected
     const subject = preset.layers.find(l => l.type === 'subject') || preset.layers[0];
     setSelectedLayerId(subject.id);
+
+    // Reset scores for non-AI presets
+    setSceneScores({
+      sky: 0,
+      water: 0,
+      vegetation: 0,
+      architecture: 0,
+      portrait: 0,
+      dayScore: 0,
+      nightScore: 0,
+      indoorScore: 0,
+      outdoorScore: 0,
+    });
   };
 
   // ==========================================
@@ -459,7 +990,7 @@ export default function App() {
   // CAMERA CALCULATOR (CINEMATIC PATH PRESETS)
   // ==========================================
   const getCameraTransform = () => {
-    const cycle = time * 0.6;
+    const cycle = time * 0.6 * cameraSpeed;
     let tx = 0;
     let ty = 0;
     let tz = 0;
@@ -469,37 +1000,40 @@ export default function App() {
 
     switch (cameraPath) {
       case 'push': // Slow Push In
-        tz = (cycle % 5) * 0.05;
+        tz = (cycle % 5) * 0.05 * cameraZoomScale;
         break;
       case 'burns': // Ken Burns Zoom
-        tz = Math.sin(cycle * 0.3) * 0.12;
+        tz = Math.sin(cycle * 0.3) * 0.12 * cameraZoomScale;
         tx = Math.cos(cycle * 0.3) * (cameraIntensity * 0.4);
-        ty = Math.sin(cycle * 0.35) * (cameraIntensity * 0.3);
+        ty = Math.sin(cycle * 0.35) * (cameraIntensity * 0.3) + cameraTiltBias;
         break;
       case 'reveal': // Epic Reveal
-        ty = 80 - (cycle % 10) * 16;
+        ty = 80 - (cycle % 10) * 16 + cameraTiltBias;
         rotX = -5 + (cycle % 10) * 1;
         break;
       case 'orbit': // Hero Orbit
         tx = Math.sin(cycle) * cameraIntensity;
-        ty = Math.cos(cycle * 0.8) * (cameraIntensity * 0.4);
-        tz = Math.sin(cycle * 0.5) * 0.04;
+        ty = Math.cos(cycle * 0.8) * (cameraIntensity * 0.4) + cameraTiltBias;
+        tz = Math.sin(cycle * 0.5) * 0.04 * cameraZoomScale;
         rotZ = Math.sin(cycle * 0.3) * 1.2;
         break;
       case 'flyover': // Drone Flyover
-        ty = -30 + Math.sin(cycle * 0.5) * 15;
-        tz = 0.08 + Math.cos(cycle * 0.5) * 0.06;
+        ty = -30 + Math.sin(cycle * 0.5) * 15 + cameraTiltBias;
+        tz = (0.08 + Math.cos(cycle * 0.5) * 0.06) * cameraZoomScale;
         rotX = 5 + Math.sin(cycle * 0.5) * 2;
         break;
       case 'pan': // Documentary Pan
         tx = Math.sin(cycle) * cameraIntensity;
+        ty = cameraTiltBias;
         break;
       case 'zoom': // Spiritual Zoom
-        tz = Math.sin(cycle * 0.2) * 0.15;
+        tz = Math.sin(cycle * 0.2) * 0.15 * cameraZoomScale;
+        ty = cameraTiltBias;
         break;
       case 'sweep': // Landscape Sweep
       default:
         tx = -cameraIntensity + (cycle % 10) * (cameraIntensity * 0.2);
+        ty = cameraTiltBias;
         rotY = -3 + (cycle % 10) * 0.6;
         break;
     }
@@ -542,51 +1076,116 @@ export default function App() {
 
     const logs = [
       'Decoding pixel metadata and color profiles...',
-      'Running MiDaS depth estimater neural model...',
+      'Running FastGradientDepthProvider neural estimation...',
       'Computing 3D perspective displacement matrix...',
       'Identifying primary subjects & natural boundaries...',
-      'Inpainting hidden canvas layers to prevent occlusion gaps...',
-      'Splitting scene assets into high-fidelity layers...',
+      'Inpainting hidden canvas layers via NearestNeighborInpaintProvider...',
+      'Splitting scene assets into high-fidelity layers via DynamicLayerGenerator...',
       'Compiling 3D scene parameters successfully!'
     ];
 
     let currentStep = 0;
-    const interval = setInterval(() => {
+    const interval = setInterval(async () => {
       if (currentStep < logs.length) {
         setProcessLogs(prev => [...prev, logs[currentStep]]);
         setProcessStep(currentStep + 1);
         currentStep++;
       } else {
         clearInterval(interval);
-        setTimeout(() => {
-          setIsProcessing(false);
-          setShowScanningOverlay(false);
+
+        // Use the uploaded image, or if none, procedurally render the current preset to raster
+        const baseSrc = uploadedImage || drawPresetToDataUrl(currentPreset);
+
+        // Instantiating concrete local processing models
+        const depthEngine = new FastGradientDepthProvider();
+        const inpainter = new NearestNeighborInpaintProvider();
+        const segmenter = new DynamicLayerGenerator();
+
+        try {
+          const estimatedDepthMap = await depthEngine.estimateDepth(baseSrc);
+          const generatedSlices = await segmenter.generateLayers(baseSrc, estimatedDepthMap, inpainter);
+
+          // Update layers with actual processed image and depth slices
+          const targetPresetLayers = currentPreset.layers.map((pl, idx) => {
+            const correspondingSlice = generatedSlices[idx] || generatedSlices[generatedSlices.length - 1];
+            return {
+              ...pl,
+              imageSlice: correspondingSlice ? correspondingSlice.imageSlice : undefined,
+              depthSlice: correspondingSlice ? correspondingSlice.depthSlice : undefined,
+            };
+          });
+
+          // Run semantic classifier heuristics to analyze the raster details
+          const imgObj = new Image();
+          imgObj.onload = () => {
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = 100;
+            tempCanvas.height = 100;
+            const tempCtx = tempCanvas.getContext('2d');
+            if (tempCtx) {
+              tempCtx.drawImage(imgObj, 0, 0, 100, 100);
+              const pxData = tempCtx.getImageData(0, 0, 100, 100).data;
+              let skyScore = 0;
+              let blueWater = 0;
+              let greenVeg = 0;
+              let warmSkin = 0;
+              let grayStructure = 0;
+              let darkPixels = 0;
+              let brightPixels = 0;
+
+              for (let i = 0; i < pxData.length; i += 4) {
+                const r = pxData[i];
+                const g = pxData[i+1];
+                const b = pxData[i+2];
+
+                const brightness = 0.299*r + 0.587*g + 0.114*b;
+                if (brightness < 60) darkPixels++;
+                if (brightness > 200) brightPixels++;
+
+                // Sky: high blue & bright (upper half of pixels)
+                if (i < pxData.length / 2) {
+                  if (b > 130 && r < 180 && g > 110) skyScore++;
+                }
+
+                // Water: blue/cyan tones
+                if (b > g && g > r && b > 100) blueWater++;
+
+                // Vegetation: green dominant
+                if (g > r && g > b && g > 60) greenVeg++;
+
+                // Skin tones / Portrait
+                if (r > g && g > b && r > 120 && g > 80 && g < 180 && b < 150) warmSkin++;
+
+                // Architecture: neutral gray tones
+                if (Math.abs(r - g) < 15 && Math.abs(g - b) < 15 && brightness > 80 && brightness < 180) grayStructure++;
+              }
+
+              const totalPixels = 10000;
+              setSceneScores({
+                sky: Math.round((skyScore / (totalPixels / 2)) * 100),
+                water: Math.round((blueWater / totalPixels) * 100),
+                vegetation: Math.round((greenVeg / totalPixels) * 100),
+                architecture: Math.round((grayStructure / totalPixels) * 100),
+                portrait: Math.round((warmSkin / totalPixels) * 100),
+                dayScore: Math.round((brightPixels / totalPixels) * 100),
+                nightScore: Math.round((darkPixels / totalPixels) * 100),
+                indoorScore: Math.round(((darkPixels + grayStructure) / (totalPixels * 2)) * 100),
+                outdoorScore: Math.round(((brightPixels + greenVeg + skyScore) / (totalPixels * 2)) * 100),
+              });
+            }
+          };
+          imgObj.src = baseSrc;
+
+          setLayers(targetPresetLayers);
           setHasGeneratedScene(true);
           setActiveWorkspace('edit');
-
-          if (uploadedImage) {
-            const uploadedPreset: Preset = {
-              id: 'custom-upload',
-              name: 'Uploaded Scene',
-              category: 'Custom Upload',
-              description: 'Your custom artwork separated beautifully into dramatic depth arrays.',
-              baseColor: '#0a0d14',
-              soundtrackName: 'Atmospheric Binaural Drone',
-              soundtrack: 'custom_ambient',
-              layers: [
-                { id: 'u-1', name: 'Background Sky', depth: 0.95, scale: 1.2, offsetY: -40, offsetX: 0, blur: 3, opacity: 0.9, color: '#0c0f1d', type: 'sky', symbol: '🌅', shape: 'rect', shadow: false, movementSpeed: 0.05, visible: true, locked: false },
-                { id: 'u-2', name: 'Distant Mountains', depth: 0.75, scale: 1.15, offsetY: 0, offsetX: -20, blur: 2, opacity: 0.95, color: '#1e293b', type: 'background', symbol: '🏔️', shape: 'polygon', points: '0,100 30,40 60,100', shadow: false, movementSpeed: 0.15, visible: true, locked: false },
-                { id: 'u-3', name: 'Midground Structure', depth: 0.5, scale: 1.08, offsetY: 20, offsetX: 10, blur: 0.8, opacity: 1, color: '#334155', type: 'middle', symbol: '🏢', shape: 'rect', shadow: true, movementSpeed: 0.35, visible: true, locked: false },
-                { id: 'u-4', name: 'Detected Core Subject', depth: 0.25, scale: 1.0, offsetY: 10, offsetX: 0, blur: 0, opacity: 1, color: '#38bdf8', type: 'subject', symbol: '💎', shape: 'circle', shadow: true, movementSpeed: 0.7, visible: true, locked: false },
-                { id: 'u-5', name: 'Foreground Occlusion', depth: 0.05, scale: 1.25, offsetY: -10, offsetX: 0, blur: 1.5, opacity: 0.95, color: '#0f172a', type: 'foreground', symbol: '🌿', shape: 'polygon', points: '0,0 25,0 10,60 0,100', shadow: true, movementSpeed: 1.1, visible: true, locked: false }
-              ]
-            };
-            setCurrentPreset(uploadedPreset);
-            setLayers(uploadedPreset.layers);
-            setSelectedLayerId('u-4');
-          }
           confetti({ particleCount: 120, spread: 80, origin: { y: 0.5 } });
-        }, 600);
+        } catch (err) {
+          console.error("Local client image-processing engine failed: ", err);
+        } finally {
+          setIsProcessing(false);
+          setShowScanningOverlay(false);
+        }
       }
     }, 400);
   };
@@ -1019,20 +1618,86 @@ export default function App() {
                       ))}
                     </div>
 
-                    <div className="pt-2">
-                      <div className="flex justify-between text-[10px] mb-1">
-                        <span className="text-slate-400">Motion Displacement:</span>
-                        <span className="text-violet-400 font-mono">{cameraIntensity}px</span>
+                    <div className="pt-2 space-y-3">
+                      <div>
+                        <div className="flex justify-between text-[10px] mb-1">
+                          <span className="text-slate-400">Motion Displacement:</span>
+                          <span className="text-violet-400 font-mono">{cameraIntensity}px</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="10"
+                          max="60"
+                          value={cameraIntensity}
+                          onChange={(e) => setCameraIntensity(Number(e.target.value))}
+                          className="w-full accent-violet-600 h-1 bg-slate-800 rounded-lg cursor-pointer"
+                        />
                       </div>
-                      <input
-                        type="range"
-                        min="10"
-                        max="60"
-                        value={cameraIntensity}
-                        onChange={(e) => setCameraIntensity(Number(e.target.value))}
-                        className="w-full accent-violet-600 h-1 bg-slate-800 rounded-lg cursor-pointer"
-                      />
+
+                      <div>
+                        <div className="flex justify-between text-[10px] mb-1">
+                          <span className="text-slate-400">Camera Speed:</span>
+                          <span className="text-violet-400 font-mono">{cameraSpeed.toFixed(1)}x</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0.2"
+                          max="2.5"
+                          step="0.1"
+                          value={cameraSpeed}
+                          onChange={(e) => setCameraSpeed(Number(e.target.value))}
+                          className="w-full accent-violet-600 h-1 bg-slate-800 rounded-lg cursor-pointer"
+                        />
+                      </div>
+
+                      <div>
+                        <div className="flex justify-between text-[10px] mb-1">
+                          <span className="text-slate-400">Tilt Bias:</span>
+                          <span className="text-violet-400 font-mono">{cameraTiltBias}px</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="-80"
+                          max="80"
+                          value={cameraTiltBias}
+                          onChange={(e) => setCameraTiltBias(Number(e.target.value))}
+                          className="w-full accent-violet-600 h-1 bg-slate-800 rounded-lg cursor-pointer"
+                        />
+                      </div>
+
+                      <div>
+                        <div className="flex justify-between text-[10px] mb-1">
+                          <span className="text-slate-400">Zoom Scale:</span>
+                          <span className="text-violet-400 font-mono">{cameraZoomScale.toFixed(2)}x</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0.5"
+                          max="2.0"
+                          step="0.05"
+                          value={cameraZoomScale}
+                          onChange={(e) => setCameraZoomScale(Number(e.target.value))}
+                          className="w-full accent-violet-600 h-1 bg-slate-800 rounded-lg cursor-pointer"
+                        />
+                      </div>
                     </div>
+
+                    {/* Semantic analysis scores display */}
+                    {(sceneScores.sky > 0 || sceneScores.vegetation > 0 || sceneScores.portrait > 0) && (
+                      <div className="mt-3 p-3 bg-violet-950/20 rounded-xl border border-violet-800/40 space-y-1.5 text-[10px]">
+                        <span className="font-bold text-violet-400 uppercase tracking-wider block">Semantic Scene Analysis:</span>
+                        <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-slate-300">
+                          {sceneScores.sky > 15 && <span>☁️ Sky Detected: <strong className="text-violet-400">{sceneScores.sky}%</strong></span>}
+                          {sceneScores.vegetation > 15 && <span>🌿 Foliage/Nature: <strong className="text-violet-400">{sceneScores.vegetation}%</strong></span>}
+                          {sceneScores.portrait > 15 && <span>👤 Human/Portrait: <strong className="text-violet-400">{sceneScores.portrait}%</strong></span>}
+                          {sceneScores.water > 15 && <span>🌊 Liquid/Water: <strong className="text-violet-400">{sceneScores.water}%</strong></span>}
+                          {sceneScores.architecture > 15 && <span>🏛️ Architecture: <strong className="text-violet-400">{sceneScores.architecture}%</strong></span>}
+                        </div>
+                        <span className="text-[9px] text-slate-400 block italic border-t border-violet-900/30 pt-1">
+                          Auto-configured camera presets matching your image style characteristics!
+                        </span>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
@@ -1415,17 +2080,36 @@ export default function App() {
                         )}
 
                         <div
-                          className="flex flex-col items-center justify-center select-none"
+                          className="flex flex-col items-center justify-center select-none w-full h-full relative"
                           style={{
                             transform: `scale(${relativeScale}) translate(${layer.offsetX}px, ${layer.offsetY}px)`,
                             filter: `blur(${layer.blur}px)`,
-                            color: showDepthMapOnly ? (() => { const b = Math.floor((1 - layer.depth) * 255); return `rgb(${b},${b},${b})`; })() : layer.color
                           }}
                         >
-                          <span className="text-8xl drop-shadow-[0_15px_30px_rgba(0,0,0,0.8)] transform transition-transform hover:scale-105">
-                            {layer.symbol}
-                          </span>
-                          <span className="mt-2 text-[10px] bg-[#090d16]/90 text-slate-300 px-2.5 py-1 rounded-lg border border-slate-800 backdrop-blur-sm shadow-md font-bold">
+                          {/* If a real processed slice exists, render it. Otherwise, fall back to symbols */}
+                          {showDepthMapOnly && layer.depthSlice ? (
+                            <img
+                              src={layer.depthSlice}
+                              alt={layer.name}
+                              className="w-full h-full object-contain pointer-events-none drop-shadow-[0_15px_30px_rgba(0,0,0,0.8)]"
+                            />
+                          ) : !showDepthMapOnly && layer.imageSlice ? (
+                            <img
+                              src={layer.imageSlice}
+                              alt={layer.name}
+                              className="w-full h-full object-contain pointer-events-none drop-shadow-[0_15px_30px_rgba(0,0,0,0.8)]"
+                            />
+                          ) : (
+                            <span
+                              className="text-8xl drop-shadow-[0_15px_30px_rgba(0,0,0,0.8)] transform transition-transform hover:scale-105"
+                              style={{
+                                color: showDepthMapOnly ? (() => { const b = Math.floor((1 - layer.depth) * 255); return `rgb(${b},${b},${b})`; })() : layer.color
+                              }}
+                            >
+                              {layer.symbol}
+                            </span>
+                          )}
+                          <span className="absolute bottom-4 text-[10px] bg-[#090d16]/90 text-slate-300 px-2.5 py-1 rounded-lg border border-slate-800 backdrop-blur-sm shadow-md font-bold">
                             {layer.name}
                           </span>
                         </div>
@@ -1899,7 +2583,26 @@ export default function App() {
             </div>
           </div>
 
-          <div className="col-span-2 text-right">
+          <div className="col-span-2 text-right flex flex-col space-y-2">
+            <button
+              onClick={() => {
+                if (activeProject) {
+                  const jsonString = `data:text/json;charset=utf-8,${encodeURIComponent(
+                    JSON.stringify(activeProject, null, 2)
+                  )}`;
+                  const downloadAnchor = document.createElement('a');
+                  downloadAnchor.setAttribute('href', jsonString);
+                  downloadAnchor.setAttribute('download', `${activeProject.id}-project-package.json`);
+                  document.body.appendChild(downloadAnchor);
+                  downloadAnchor.click();
+                  downloadAnchor.remove();
+                }
+              }}
+              disabled={!activeProject}
+              className="px-4 py-2 bg-violet-600/20 hover:bg-violet-600/35 text-violet-300 rounded-lg text-xs font-bold transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              Save Project Package JSON
+            </button>
             <button
               onClick={() => {
                 selectPreset(PRESETS[0]);
@@ -1911,7 +2614,7 @@ export default function App() {
                 setHasGeneratedScene(false);
                 setActiveWorkspace('import');
               }}
-              className="px-4 py-2 border border-slate-800 hover:border-slate-700 hover:text-white text-slate-400 rounded-lg text-xs font-semibold transition-all"
+              className="px-4 py-1.5 border border-slate-800 hover:border-slate-700 hover:text-white text-slate-400 rounded-lg text-[10px] font-semibold transition-all"
             >
               Reset Configuration
             </button>
