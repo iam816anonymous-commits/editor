@@ -29,6 +29,12 @@ __pycache__/
 *.pyo
 *.pyd
 
-# V0 Rendering artifacts
+# V0 Rendering & Model artifacts
+output/
 v0_*.png
 v0_output.mp4
+*.mp4
+*.png
+.cache/
+hf_cache/
+torch_cache/
