@@ -41,202 +41,196 @@ class DepthAnythingV2SmallWrapper:
     """
     Wrapper for Depth Anything V2 Small.
     Loads actual HF depth-anything/Depth-Anything-V2-Small-hf model weights.
+    Strictly enforces real model execution.
     """
     def __init__(self):
         self.processor = None
         self.model = None
-        self.is_real = False
+        self.model_loaded = False
+        self.inference_success = False
+        self.fallback_used = False
         self.device = "cpu"
-        self.checkpoint_name = "depth-anything/Depth-Anything-V2-Small-hf"
+        self.checkpoint = "depth-anything/Depth-Anything-V2-Small-hf"
 
         if HAS_TORCH and HAS_TRANSFORMERS:
             try:
                 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
                 self.device = "cuda" if torch.cuda.is_available() else "cpu"
-                print(f"[MODEL INIT] Loading Depth Anything V2 Small ({self.checkpoint_name}) on {self.device}...")
-                self.processor = AutoImageProcessor.from_pretrained(self.checkpoint_name)
-                self.model = AutoModelForDepthEstimation.from_pretrained(self.checkpoint_name).to(self.device)
+                print(f"[MODEL INIT] Loading Depth Anything V2 Small ({self.checkpoint}) on {self.device}...")
+                self.processor = AutoImageProcessor.from_pretrained(self.checkpoint)
+                self.model = AutoModelForDepthEstimation.from_pretrained(self.checkpoint).to(self.device)
                 self.model.eval()
-                self.is_real = True
+                self.model_loaded = True
             except Exception as e:
-                print(f"[WARNING] Depth Anything V2 initialization failed: {e}")
-                self.is_real = False
+                print(f"[ERROR] Depth Anything V2 model initialization failed: {e}")
+                self.model_loaded = False
 
     def print_proof(self):
         print("\n============================================================")
         print("DEPTH ENGINE")
         print(f"model = Depth Anything V2 Small")
-        print(f"checkpoint = {self.checkpoint_name if self.is_real else 'N/A'}")
-        print(f"backend = {self.device.upper() if self.is_real else 'CPU (Fallback)'}")
-        print(f"inference = {'REAL' if self.is_real else 'FALLBACK DEPTH MODE'}")
+        print(f"checkpoint = {self.checkpoint if self.model_loaded else 'N/A'}")
+        print(f"backend = {self.device.upper()}")
+        print(f"model_loaded = {self.model_loaded}")
+        print(f"inference_success = {self.inference_success}")
+        print(f"fallback_used = {self.fallback_used}")
         print("============================================================\n")
 
     def infer(self, img_rgb):
         """
         Runs monocular depth estimation on input RGB image (np.ndarray uint8).
         Returns normalized depth map in [0, 1] as float32.
+        Fails clearly if real model inference fails.
         """
-        if self.is_real and self.model is not None and self.processor is not None:
-            try:
-                pil_img = Image.fromarray(img_rgb)
-                w, h = pil_img.size
-                inputs = self.processor(images=pil_img, return_tensors="pt").to(self.device)
-                with torch.no_grad():
-                    outputs = self.model(**inputs)
-                    predicted_depth = outputs.predicted_depth
+        if not self.model_loaded or self.model is None or self.processor is None:
+            self.fallback_used = True
+            raise RuntimeError(f"Strict Real Model Policy Violation: Depth Anything V2 ({self.checkpoint}) failed to load.")
 
-                # Interpolate to original image resolution
-                interpolated = torch.nn.functional.interpolate(
-                    predicted_depth.unsqueeze(1),
-                    size=(h, w),
-                    mode="bicubic",
-                    align_corners=False,
-                )
-                depth_np = interpolated.squeeze().cpu().numpy().astype(np.float32)
+        try:
+            pil_img = Image.fromarray(img_rgb)
+            w, h = pil_img.size
+            inputs = self.processor(images=pil_img, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                predicted_depth = outputs.predicted_depth
 
-                # Min-max normalization
-                d_min, d_max = depth_np.min(), depth_np.max()
-                if d_max > d_min:
-                    norm_depth = (depth_np - d_min) / (d_max - d_min)
-                else:
-                    norm_depth = np.zeros_like(depth_np, dtype=np.float32)
+            # Interpolate to original image resolution
+            interpolated = torch.nn.functional.interpolate(
+                predicted_depth.unsqueeze(1),
+                size=(h, w),
+                mode="bicubic",
+                align_corners=False,
+            )
+            depth_np = interpolated.squeeze().cpu().numpy().astype(np.float32)
 
-                return norm_depth
-            except Exception as e:
-                print(f"[ERROR] Real Depth Anything V2 inference failed: {e}. Falling back...")
-                self.is_real = False
+            # Min-max normalization
+            d_min, d_max = depth_np.min(), depth_np.max()
+            if d_max > d_min:
+                norm_depth = (depth_np - d_min) / (d_max - d_min)
+            else:
+                norm_depth = np.zeros_like(depth_np, dtype=np.float32)
 
-        # Approved Fallback Monocular Depth
-        h, w, _ = img_rgb.shape
-        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-        y_coords, _ = np.mgrid[0:h, 0:w]
-        depth_base = (y_coords / float(h - 1)) * 0.7
-        norm_gray = gray.astype(float) / 255.0
-        depth_lum = norm_gray * 0.3
-        raw_depth = np.clip(depth_base + depth_lum, 0.0, 1.0)
-        return raw_depth.astype(np.float32)
+            self.inference_success = True
+            self.fallback_used = False
+            return norm_depth
+        except Exception as e:
+            self.inference_success = False
+            self.fallback_used = True
+            raise RuntimeError(f"Strict Real Model Policy Violation: Depth Anything V2 inference failed: {e}")
 
 
 class SAM2SegmentationWrapper:
     """
     Wrapper for SAM 2 primary subject segmentation.
     Loads facebook/sam2-hiera-tiny via HuggingFace transformers model and processor.
+    Strictly enforces real model execution.
     """
     def __init__(self):
         self.processor = None
         self.model = None
-        self.is_real = False
+        self.model_loaded = False
+        self.inference_success = False
+        self.fallback_used = False
         self.device = "cpu"
-        self.checkpoint_name = "facebook/sam2-hiera-tiny"
+        self.checkpoint = "facebook/sam2-hiera-tiny"
 
         if HAS_TORCH and HAS_TRANSFORMERS:
             try:
                 from transformers import AutoProcessor, AutoModelForMaskGeneration
                 self.device = "cuda" if torch.cuda.is_available() else "cpu"
-                print(f"[MODEL INIT] Loading SAM 2 ({self.checkpoint_name}) on {self.device}...")
-                self.processor = AutoProcessor.from_pretrained(self.checkpoint_name)
-                self.model = AutoModelForMaskGeneration.from_pretrained(self.checkpoint_name).to(self.device)
+                print(f"[MODEL INIT] Loading SAM 2 ({self.checkpoint}) on {self.device}...")
+                self.processor = AutoProcessor.from_pretrained(self.checkpoint)
+                self.model = AutoModelForMaskGeneration.from_pretrained(self.checkpoint).to(self.device)
                 self.model.eval()
-                self.is_real = True
+                self.model_loaded = True
             except Exception as e:
-                print(f"[WARNING] SAM 2 initialization failed: {e}")
-                self.is_real = False
+                print(f"[ERROR] SAM 2 model initialization failed: {e}")
+                self.model_loaded = False
 
     def print_proof(self):
         print("============================================================")
         print("SEGMENTATION ENGINE")
         print(f"model = SAM 2")
-        print(f"checkpoint = {self.checkpoint_name if self.is_real else 'N/A'}")
-        print(f"backend = {self.device.upper() if self.is_real else 'CPU (Fallback)'}")
-        print(f"inference = {'REAL' if self.is_real else 'SAM2 UNAVAILABLE — FALLBACK ACTIVE'}")
+        print(f"checkpoint = {self.checkpoint if self.model_loaded else 'N/A'}")
+        print(f"backend = {self.device.upper()}")
+        print(f"model_loaded = {self.model_loaded}")
+        print(f"inference_success = {self.inference_success}")
+        print(f"fallback_used = {self.fallback_used}")
         print("============================================================\n")
 
     def segment(self, img_rgb, depth_map):
         """
         Extracts primary subject mask (uint8 0 or 255) and returns segmentation confidence.
+        Fails clearly if real model inference fails.
         """
+        if not self.model_loaded or self.model is None or self.processor is None:
+            self.fallback_used = True
+            raise RuntimeError(f"Strict Real Model Policy Violation: SAM 2 ({self.checkpoint}) failed to load.")
+
         h, w, c = img_rgb.shape
 
-        if self.is_real and self.model is not None and self.processor is not None:
-            try:
-                pil_img = Image.fromarray(img_rgb)
+        try:
+            pil_img = Image.fromarray(img_rgb)
 
-                # Generate a 3x3 grid of point prompts over the image canvas
-                grid_pts = []
-                for gy in np.linspace(h * 0.25, h * 0.75, 3):
-                    for gx in np.linspace(w * 0.25, w * 0.75, 3):
-                        grid_pts.append([[int(gx), int(gy)]])
-                input_points = [grid_pts]
+            # Generate a 3x3 grid of point prompts over the image canvas
+            grid_pts = []
+            for gy in np.linspace(h * 0.25, h * 0.75, 3):
+                for gx in np.linspace(w * 0.25, w * 0.75, 3):
+                    grid_pts.append([[int(gx), int(gy)]])
+            input_points = [grid_pts]
 
-                inputs = self.processor(images=pil_img, input_points=input_points, return_tensors="pt").to(self.device)
-                with torch.no_grad():
-                    outputs = self.model(**inputs)
+            inputs = self.processor(images=pil_img, input_points=input_points, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                outputs = self.model(**inputs)
 
-                # outputs.pred_masks: [1, N_objects, 3, H_low, W_low]
-                # outputs.iou_scores: [1, N_objects, 3]
-                all_masks = outputs.pred_masks[0].cpu().numpy()
-                all_scores = outputs.iou_scores[0].cpu().numpy()
+            all_masks = outputs.pred_masks[0].cpu().numpy()
+            all_scores = outputs.iou_scores[0].cpu().numpy()
 
-                cy, cx = h / 2.0, w / 2.0
-                y_coords, x_coords = np.mgrid[0:h, 0:w]
-                dist_from_center = np.sqrt((y_coords - cy)**2 + (x_coords - cx)**2)
-                max_dist = np.sqrt(cy**2 + cx**2)
-                center_weight = 1.0 - (dist_from_center / max_dist)
+            cy, cx = h / 2.0, w / 2.0
+            y_coords, x_coords = np.mgrid[0:h, 0:w]
+            dist_from_center = np.sqrt((y_coords - cy)**2 + (x_coords - cx)**2)
+            max_dist = np.sqrt(cy**2 + cx**2)
+            center_weight = 1.0 - (dist_from_center / max_dist)
 
-                best_mask_bool = None
-                best_combined_score = -1.0
-                best_raw_score = 0.0
+            best_mask_bool = None
+            best_combined_score = -1.0
+            best_raw_score = 0.0
 
-                for obj_idx in range(all_masks.shape[0]):
-                    for m_idx in range(all_masks[obj_idx].shape[0]):
-                        raw_mask = all_masks[obj_idx, m_idx]
-                        score_val = float(all_scores[obj_idx, m_idx])
+            for obj_idx in range(all_masks.shape[0]):
+                for m_idx in range(all_masks[obj_idx].shape[0]):
+                    raw_mask = all_masks[obj_idx, m_idx]
+                    score_val = float(all_scores[obj_idx, m_idx])
 
-                        # SAM 2 outputs logits, threshold > 0 for boolean mask
-                        mask_bool = (raw_mask > 0)
-                        if mask_bool.shape != (h, w):
-                            mask_bool = cv2.resize(mask_bool.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+                    mask_bool = (raw_mask > 0)
+                    if mask_bool.shape != (h, w):
+                        mask_bool = cv2.resize(mask_bool.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
 
-                        coverage = np.sum(mask_bool) / float(h * w)
+                    coverage = np.sum(mask_bool) / float(h * w)
 
-                        if 0.05 <= coverage <= 0.75:
-                            avg_center = np.mean(center_weight[mask_bool])
-                            avg_depth = np.mean(depth_map[mask_bool])
-                            combined_score = score_val * 0.4 + avg_center * 0.3 + avg_depth * 0.3
-                            if combined_score > best_combined_score:
-                                best_combined_score = combined_score
-                                best_raw_score = score_val
-                                best_mask_bool = mask_bool
+                    if 0.05 <= coverage <= 0.75:
+                        avg_center = np.mean(center_weight[mask_bool])
+                        avg_depth = np.mean(depth_map[mask_bool])
+                        combined_score = score_val * 0.4 + avg_center * 0.3 + avg_depth * 0.3
+                        if combined_score > best_combined_score:
+                            best_combined_score = combined_score
+                            best_raw_score = score_val
+                            best_mask_bool = mask_bool
 
-                if best_mask_bool is not None:
-                    mask_uint8 = (best_mask_bool * 255).astype(np.uint8)
-                    mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
-                    coverage = np.sum(best_mask_bool) / float(h * w)
-                    confidence = 0.85 if 0.05 <= coverage <= 0.75 else max(0.35, float(best_raw_score))
-                    return mask_uint8, confidence
-            except Exception as e:
-                print(f"[ERROR] Real SAM 2 segmentation failed: {e}. Falling back...")
-                self.is_real = False
+            if best_mask_bool is not None:
+                mask_uint8 = (best_mask_bool * 255).astype(np.uint8)
+                mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+                coverage = np.sum(best_mask_bool) / float(h * w)
+                confidence = 0.85 if 0.05 <= coverage <= 0.75 else max(0.35, float(best_raw_score))
+                self.inference_success = True
+                self.fallback_used = False
+                return mask_uint8, confidence
 
-        # Approved Fallback Segmentation
-        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-        y_coords, x_coords = np.mgrid[0:h, 0:w]
-        cy, cx = h / 2.0, w / 2.0
-        dist_from_center = np.sqrt((y_coords - cy)**2 + (x_coords - cx)**2)
-        max_dist = np.sqrt(cy**2 + cx**2)
-        center_weight = 1.0 - (dist_from_center / max_dist)
-
-        edges = cv2.Canny(gray, 30, 100)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        edge_density = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel).astype(float) / 255.0
-
-        subject_score = center_weight * 0.4 + depth_map * 0.4 + edge_density * 0.2
-        _, mask = cv2.threshold((subject_score * 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-
-        coverage = np.sum(mask == 255) / float(h * w)
-        confidence = 0.85 if 0.05 <= coverage <= 0.85 else 0.35
-        return mask, confidence
+            # If no suitable mask found in SAM 2 candidates, raise exception
+            raise RuntimeError("SAM 2 did not produce any valid candidate masks within coverage parameters.")
+        except Exception as e:
+            self.inference_success = False
+            self.fallback_used = True
+            raise RuntimeError(f"Strict Real Model Policy Violation: SAM 2 segmentation failed: {e}")
 
 
 def get_depth_wrapper():
@@ -756,8 +750,14 @@ def run_v0_candidate_rendering(img_rgb, refined_depth, subject_mask, seg_conf, b
 
     metrics = {
         "candidate": f"AUTO-{movement_style.upper()}",
-        "depth_model": depth_wrapper.checkpoint_name if depth_wrapper.is_real else "Fallback Depth Engine",
-        "segmentation_model": sam2_wrapper.checkpoint_name if sam2_wrapper.is_real else "Fallback Segmentation Engine",
+        "depth_model": depth_wrapper.checkpoint,
+        "depth_model_loaded": depth_wrapper.model_loaded,
+        "depth_inference_success": depth_wrapper.inference_success,
+        "depth_fallback_used": depth_wrapper.fallback_used,
+        "segmentation_model": sam2_wrapper.checkpoint,
+        "segmentation_model_loaded": sam2_wrapper.model_loaded,
+        "segmentation_inference_success": sam2_wrapper.inference_success,
+        "segmentation_fallback_used": sam2_wrapper.fallback_used,
         "max_screen_disparity_px": round(final_limit["max_disparity_px"], 2),
         "max_screen_disparity_pct": round(final_limit["max_disparity_pct"], 2),
         "foreground_displacement_tx": round(final_limit["max_tx"], 4),

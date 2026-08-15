@@ -106,10 +106,16 @@ class TestV0Pipeline(unittest.TestCase):
 
         raw_depth = depth_wrapper.infer(self.dummy_rgb)
         self.assertEqual(raw_depth.shape, (self.h, self.w))
+        self.assertTrue(depth_wrapper.model_loaded)
+        self.assertTrue(depth_wrapper.inference_success)
+        self.assertFalse(depth_wrapper.fallback_used)
 
         mask, conf = sam2_wrapper.segment(self.dummy_rgb, raw_depth)
         self.assertEqual(mask.shape, (self.h, self.w))
         self.assertGreaterEqual(conf, 0.0)
+        self.assertTrue(sam2_wrapper.model_loaded)
+        self.assertTrue(sam2_wrapper.inference_success)
+        self.assertFalse(sam2_wrapper.fallback_used)
 
     # =====================================================================
     # LEVEL 3: FILESYSTEM & DECODABILITY VERIFICATION
@@ -121,10 +127,21 @@ class TestV0Pipeline(unittest.TestCase):
         image dimensions, MP4 decodability, frame counts, and metrics JSON schema.
         """
         input_image_path = "/tmp/file_attachments/WhatsApp Image 2026-08-12 at 09.49.04.jpeg"
+        created_temp = False
         if not os.path.exists(input_image_path):
-            self.skipTest(f"Test image {input_image_path} not available.")
+            input_image_path = "/tmp/v0_test_fixture.png"
+            created_temp = True
+            # Create high resolution synthetic test fixture with distinct foreground object
+            synth = np.zeros((512, 768, 3), dtype=np.uint8)
+            cv2.rectangle(synth, (0, 0), (768, 512), (200, 180, 150), -1)
+            cv2.circle(synth, (384, 256), 120, (50, 100, 220), -1)
+            cv2.imwrite(input_image_path, synth)
 
-        v0_pipeline.run_all_phase1_candidates(input_image_path)
+        try:
+            v0_pipeline.run_all_phase1_candidates(input_image_path)
+        finally:
+            if created_temp and os.path.exists(input_image_path):
+                os.remove(input_image_path)
 
         # Import hashlib to calculate hash path
         import hashlib
@@ -186,6 +203,12 @@ class TestV0Pipeline(unittest.TestCase):
             self.assertIn("candidate", data)
             self.assertIn("max_screen_disparity_px", data)
             self.assertIn("subject_boundary_diagnostics", data)
+            self.assertTrue(data.get("depth_model_loaded", False))
+            self.assertTrue(data.get("depth_inference_success", False))
+            self.assertFalse(data.get("depth_fallback_used", True))
+            self.assertTrue(data.get("segmentation_model_loaded", False))
+            self.assertTrue(data.get("segmentation_inference_success", False))
+            self.assertFalse(data.get("segmentation_fallback_used", True))
 
 
 if __name__ == "__main__":
